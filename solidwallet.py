@@ -22,10 +22,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                             QTabWidget, QFormLayout, QGroupBox, QInputDialog,
                             QTableWidgetItem, QStyle, QHeaderView, QListWidgetItem,
                             QProgressBar, QStackedWidget, QDialog, QDialogButtonBox, QGraphicsDropShadowEffect, QScrollArea,
-                            QFrame)
+                            QFrame, QSlider)
 from PyQt5.QtGui import (QPixmap, QImage, QIcon, QPainter, QBrush, QPen, QColor,
                         QFont, QPainterPath, QDoubleValidator, QIntValidator, QRadialGradient, QConicalGradient)
-from PyQt5.QtCore import Qt, QTimer, QSize, QFile, QIODevice, pyqtSignal, QThread, QRectF, QPropertyAnimation, QEasingCurve, QPoint
+from PyQt5.QtCore import (Qt, QTimer, QSize, QFile, QIODevice, pyqtSignal, QThread, QRectF, QPropertyAnimation, QEasingCurve, QPoint)
 import resources_rc
 
 
@@ -92,8 +92,6 @@ class Worker(QThread):
             logger.warning(f"Worker no respondió a solicitud de detención, terminando forzadamente")
             self.terminate()
             self.wait()
-
-
 
 class LoadingWidget(QWidget):
     def __init__(self, parent=None):
@@ -242,49 +240,110 @@ class CryptoWallet:
             logger.error(f"Error obteniendo transacciones: {e}")
         return transactions
     
-    def send_transaction(self, to_address, amount, token_symbol='BNB', gas_limit=21000):
-        logger.debug(f"Preparando transacción de {amount} {token_symbol} a {to_address}")
+    def send_transaction(self, recipient, amount, token_symbol, gas_price=None, gas_limit=None):
+        """Envía una transacción con gas optimizado si no se especifica"""
+        logger.debug(f"Enviando transacción de {amount} {token_symbol} a {recipient}")
+        
         try:
-            to_address = Web3.to_checksum_address(to_address)
+            # Convertir a checksum address
+            recipient = Web3.to_checksum_address(recipient)
+            
+            # Si no se proporcionan parámetros de gas, calcular óptimos
+            if gas_price is None or gas_limit is None:
+                gas_params = self.calculate_optimal_gas(token_symbol)
+                gas_price = gas_params['gas_price']
+                gas_limit = gas_params['gas_limit']
+            
+            # Convertir gas price a wei
+            gas_price_wei = self.web3.to_wei(gas_price, 'gwei')
             
             if token_symbol == 'BNB':
+                # Transacción nativa de BNB
                 tx = {
-                    'from': self.address,
-                    'to': to_address,
+                    'to': recipient,
                     'value': self.web3.to_wei(amount, 'ether'),
                     'gas': gas_limit,
-                    'gasPrice': self.web3.eth.gas_price,
+                    'gasPrice': gas_price_wei,
                     'nonce': self.web3.eth.get_transaction_count(self.address),
+                    'chainId': 56  # BSC chain ID
                 }
                 
+                # Firmar y enviar
                 signed_tx = self.web3.eth.account.sign_transaction(tx, self.private_key)
                 tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                logger.debug(f"Transacción BNB enviada: {tx_hash.hex()}")
-                return tx_hash.hex()
             else:
-                contract = self.web3.eth.contract(
+                # Transacción de token ERC-20
+                token_contract = self.web3.eth.contract(
                     address=TOKEN_CONTRACTS[token_symbol],
                     abi=self._get_erc20_abi()
                 )
                 
-                tx = contract.functions.transfer(
-                    to_address,
-                    int(amount * (10 ** TOKEN_DECIMALS[token_symbol]))
+                # Calcular amount con decimales correctos
+                decimals = TOKEN_DECIMALS[token_symbol]
+                amount_wei = int(amount * (10 ** decimals))
+                
+                tx = token_contract.functions.transfer(
+                    recipient,
+                    amount_wei
                 ).build_transaction({
-                    'from': self.address,
                     'gas': gas_limit,
-                    'gasPrice': self.web3.eth.gas_price,
+                    'gasPrice': gas_price_wei,
                     'nonce': self.web3.eth.get_transaction_count(self.address),
+                    'chainId': 56  # BSC chain ID
                 })
                 
+                # Firmar y enviar
                 signed_tx = self.web3.eth.account.sign_transaction(tx, self.private_key)
                 tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                logger.debug(f"Transacción {token_symbol} enviada: {tx_hash.hex()}")
-                return tx_hash.hex()
+            
+            logger.debug(f"Transacción enviada con hash: {tx_hash.hex()}")
+            return tx_hash.hex()
+            
         except Exception as e:
             logger.error(f"Error enviando transacción: {str(e)}")
             raise
-    
+
+    def calculate_optimal_gas(self, token_symbol='BNB', speed='medium'):
+        """Calcula valores óptimos de gas basados en condiciones de red y velocidad seleccionada"""
+        try:
+            # Obtener gas price actual de la red
+            current_gas = float(self.web3.from_wei(
+                self.web3.eth.gas_price, 
+                'gwei'
+            ))
+            
+            # Multiplicadores para diferentes velocidades
+            speed_multipliers = {
+                'low': 0.7,     # Económico
+                'medium': 1.0,   # Estándar
+                'high': 1.3,     # Rápido
+                'urgent': 2.0    # Urgente
+            }
+            
+            # Validar velocidad seleccionada
+            if speed not in speed_multipliers:
+                speed = 'medium'
+            
+            gas_price = round(current_gas * speed_multipliers[speed], 1)
+            
+            # Gas limit según tipo de token
+            gas_limit = 21000 if token_symbol == 'BNB' else 100000
+            
+            return {
+                'gas_price': gas_price,
+                'gas_limit': gas_limit,
+                'speed': speed
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculando gas óptimo: {str(e)}")
+            # Valores por defecto seguros
+            return {
+                'gas_price': 5.0,
+                'gas_limit': 21000 if token_symbol == 'BNB' else 100000,
+                'speed': 'medium'
+            }
+
     def _get_erc20_abi(self):
         return json.loads('''[
             {"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
@@ -397,13 +456,24 @@ class SolidWalletGUI(QMainWindow):
         self.session_timer.timeout.connect(self.check_session)
         self.session_timer.start(60000)  # 1 minuto
         self.active_workers = []
+
+        # Timer para actualizar gas prices
+        self.gas_price_timer = QTimer(self)
+        self.gas_price_timer.timeout.connect(self.update_gas_prices)
+        self.gas_price_timer.start(5000)  # Actualizar cada 5 segundos
+        self.current_gas_prices = {'low': 3, 'medium': 5, 'high': 10, 'urgent': 20}
+        self.bnb_price = 280  # Valor por defecto
         
+        # Configuración básica de la ventana
         self.setWindowTitle("SolidWallet - BSC Wallet")
         self.resize(1000, 700)
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(1200, 900)
         self.setWindowIcon(self.create_app_icon())
         self.setStyleSheet(self.get_stylesheet())
         
+        # Centrar la ventana en la pantalla
+        self.center_on_screen()
+
         # Widget de loading
         self.loading_widget = LoadingWidget()
         self.loading_widget.setVisible(False)
@@ -436,12 +506,131 @@ class SolidWalletGUI(QMainWindow):
         self.stacked_widget.addWidget(self.no_wallet_widget)
         self.setCentralWidget(self.stacked_widget)
         
+        # Estado de conectividad
+        self.online = True
+        self.connectivity_icon = QLabel()
+        self.connectivity_icon.setFixedSize(32, 32)
+        self.connectivity_icon.setScaledContents(True)
+        self.update_connectivity_icon()
+        
+        # Configurar timer para verificar conectividad
+        self.connectivity_timer = QTimer(self)
+        self.connectivity_timer.timeout.connect(self.check_connectivity)
+        self.connectivity_timer.start(10000)  # Verificar cada 10 segundos
+        
+        # Agregar icono de conectividad a la barra de estado
+        self.statusBar().addPermanentWidget(self.connectivity_icon)
+        self.statusBar().showMessage("Conectado", 3000)
+        
         # Mostrar vista inicial
         if self.wallet_manager.wallet_files:
             self.stacked_widget.setCurrentIndex(0)
             self.show_empty_state()
         else:
             self.stacked_widget.setCurrentIndex(2)
+
+    def center_on_screen(self):
+        """Centra la ventana en la pantalla principal"""
+        frame_geometry = self.frameGeometry()
+        center_point = QApplication.desktop().availableGeometry().center()
+        frame_geometry.moveCenter(center_point)
+        self.move(frame_geometry.topLeft())
+
+    def check_connectivity(self):
+        """Verifica la conectividad a internet"""
+        try:
+            import socket
+            socket.setdefaulttimeout(3)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+            if not self.online:
+                self.set_online(True)
+        except:
+            if self.online:
+                self.set_online(False)
+
+    def set_online(self, status):
+        """Actualiza el estado de conectividad"""
+        self.online = status
+        self.update_connectivity_icon()
+        
+        if status:
+            self.statusBar().showMessage("Conectado", 3000)
+            logger.info("Conexión restablecida")
+        else:
+            self.statusBar().showMessage("Sin conexión a internet", 3000)
+            logger.warning("Sin conexión a internet")
+        
+        self.update_ui_for_connectivity()
+
+    def update_ui_for_connectivity(self):
+        """Habilita/deshabilita controles según conectividad"""
+        enable = self.online
+        
+        self.btn_new.setEnabled(enable)
+        self.btn_load.setEnabled(enable)
+        self.btn_delete.setEnabled(enable)
+        self.send_button.setEnabled(enable)
+        
+        if not enable:
+            QMessageBox.warning(self, "Sin conexión", 
+                              "No se puede conectar a internet. Algunas funciones estarán limitadas.")
+
+    def update_connectivity_icon(self):
+        """Actualiza el ícono de conectividad con tamaño aumentado"""
+        icon_size = QSize(32, 32)
+        
+        if self.online:
+            icon = QIcon(":/icons/online.svg")
+            self.connectivity_icon.setPixmap(icon.pixmap(icon_size))
+            self.connectivity_icon.setToolTip("Conectado a internet")
+        else:
+            icon = QIcon(":/icons/offline.svg")
+            self.connectivity_icon.setPixmap(icon.pixmap(icon_size))
+            self.connectivity_icon.setToolTip("Sin conexión a internet")
+        
+        self.connectivity_icon.setFixedSize(icon_size)
+
+    def update_gas_prices(self):
+        """Actualiza los precios de gas con manejo de tipos correcto"""
+        if not self.online:
+            self.show_connectivity_error()
+            return
+
+        try:
+            if not self.current_wallet:
+                return
+
+            # Obtener gas price actual de la red
+            current_gas = float(self.current_wallet.web3.from_wei(
+                self.current_wallet.web3.eth.gas_price, 'gwei'
+            ))
+            
+            # Obtener precio de BNB
+            try:
+                self.bnb_price = float(self.get_bnb_price())
+            except Exception as e:
+                logger.error(f"No se pudo obtener precio BNB: {str(e)}")
+                self.bnb_price = 280  # Valor por defecto si falla
+                
+            # Calcular niveles de gas price
+            self.current_gas_prices = {
+                'low': max(1.0, round(current_gas * 0.7, 1)),
+                'medium': round(current_gas, 1),
+                'high': round(current_gas * 1.3, 1),
+                'urgent': round(current_gas * 2.0, 1)
+            }
+            
+            # Actualizar el combo box de velocidad
+            if hasattr(self, 'speed_combo'):
+                self.speed_combo.setItemText(0, f"Económica ({self.current_gas_prices['low']} gwei)")
+                self.speed_combo.setItemText(1, f"Estándar ({self.current_gas_prices['medium']} gwei)")
+                self.speed_combo.setItemText(2, f"Rápida ({self.current_gas_prices['high']} gwei)")
+                self.speed_combo.setItemText(3, f"Urgente ({self.current_gas_prices['urgent']} gwei)")
+            
+            self.update_estimated_fee()
+            
+        except Exception as e:
+            logger.error(f"Error en update_gas_prices: {str(e)}")
 
     def show_empty_state(self):
         self.empty_right_panel.setVisible(True)
@@ -487,36 +676,26 @@ class SolidWalletGUI(QMainWindow):
         card_layout.setAlignment(Qt.AlignCenter)
         card_layout.setSpacing(20)
 
-        # Configuración perfecta para la imagen
         icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignCenter)
         icon_label.setStyleSheet("background: transparent; padding: 0; margin: 0;")
         
-        # 1. Cargar la imagen original
         original_pixmap = QPixmap(":/icons/no_wallet.png")
+        max_size = 200
         
-        # 2. Definir tamaño máximo deseado (ajusta según necesites)
-        max_size = 200  # Para una imagen cuadrada
-        
-        # 3. Escalado inteligente que mantiene la imagen completa
         if original_pixmap.width() > original_pixmap.height():
-            # Imagen horizontal
             scaled_pixmap = original_pixmap.scaledToWidth(max_size, Qt.SmoothTransformation)
         else:
-            # Imagen vertical o cuadrada
             scaled_pixmap = original_pixmap.scaledToHeight(max_size, Qt.SmoothTransformation)
         
-        # 4. Aplicar la imagen escalada
         icon_label.setPixmap(scaled_pixmap)
         
-        # 5. Opcional: Centrar en un área cuadrada si lo prefieres
         icon_container = QWidget()
         icon_container.setFixedSize(max_size, max_size)
         icon_layout = QHBoxLayout(icon_container)
         icon_layout.setContentsMargins(0, 0, 0, 0)
         icon_layout.addWidget(icon_label)
 
-        # Resto de la interfaz
         title = QLabel("Billetera Desconectada")
         title.setStyleSheet("""
             font-size: 24px;
@@ -537,13 +716,11 @@ class SolidWalletGUI(QMainWindow):
         layout = QVBoxLayout()
         layout.setSpacing(15)
         
-        # Tabs
         self.tabs = QTabWidget()
         self.setup_info_tab()
         self.setup_tx_tab()
         self.setup_send_tab()
         
-        # Botón desconectar
         self.disconnect_btn = QPushButton("Desconectar Billetera")
         self.disconnect_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogCloseButton))
         self.disconnect_btn.setStyleSheet("""
@@ -564,14 +741,11 @@ class SolidWalletGUI(QMainWindow):
         self.wallet_right_panel.setLayout(layout)
         self.wallet_right_panel.setVisible(False)
         self.main_layout.addWidget(self.wallet_right_panel, 1)
-        
 
     def closeEvent(self, event):
         """Manejar el cierre de la aplicación de forma segura"""
         logger.debug("Iniciando cierre de la aplicación")
         
-        # Detener todos los workers activos
-        logger.debug(f"Deteniendo {len(self.active_workers)} workers activos")
         for worker in self.active_workers:
             try:
                 logger.debug(f"Deteniendo worker {id(worker)}")
@@ -579,10 +753,8 @@ class SolidWalletGUI(QMainWindow):
             except Exception as e:
                 logger.error(f"Error deteniendo worker: {str(e)}\n{traceback.format_exc()}")
         
-        # Limpiar todos los workers
         self.cleanup_workers()
         
-        # Verificar si quedó algún worker activo
         if self.active_workers:
             logger.warning(f"Aún hay {len(self.active_workers)} workers activos después de limpieza")
             reply = QMessageBox.question(
@@ -605,13 +777,11 @@ class SolidWalletGUI(QMainWindow):
         layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(25)
         
-        # Logo más grande (250x250)
         logo_label = QLabel()
         pixmap = QPixmap(":/icons/solidwallet.png").scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         logo_label.setPixmap(pixmap)
         logo_label.setAlignment(Qt.AlignCenter)
         
-        # Título con sombra
         title = QLabel("SolidWallet")
         title.setStyleSheet("""
             QLabel {
@@ -623,7 +793,6 @@ class SolidWalletGUI(QMainWindow):
             }
         """)
         
-        # Efecto de sombra para el título
         shadow = QGraphicsDropShadowEffect()
         shadow.setBlurRadius(10)
         shadow.setColor(QColor(0, 0, 0, 80))
@@ -631,7 +800,6 @@ class SolidWalletGUI(QMainWindow):
         title.setGraphicsEffect(shadow)
         title.setAlignment(Qt.AlignCenter)
         
-        # Subtítulo con estilo mejorado
         subtitle = QLabel("Tu billetera segura para Binance Smart Chain")
         subtitle.setStyleSheet("""
             QLabel {
@@ -643,7 +811,6 @@ class SolidWalletGUI(QMainWindow):
         """)
         subtitle.setAlignment(Qt.AlignCenter)
         
-        # Contenedor de botones con sombra
         btn_container = QWidget()
         btn_container.setStyleSheet("""
             QWidget {
@@ -653,7 +820,6 @@ class SolidWalletGUI(QMainWindow):
             }
         """)
         
-        # Efecto de sombra para el contenedor
         container_shadow = QGraphicsDropShadowEffect()
         container_shadow.setBlurRadius(15)
         container_shadow.setColor(QColor(0, 0, 0, 30))
@@ -664,7 +830,6 @@ class SolidWalletGUI(QMainWindow):
         btn_layout.setContentsMargins(50, 20, 50, 20)
         btn_layout.setSpacing(20)
         
-        # Botón de crear con icono más grande
         btn_create = QPushButton(" Crear Nueva Billetera")
         btn_create.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
         btn_create.setIconSize(QSize(24, 24))
@@ -688,7 +853,6 @@ class SolidWalletGUI(QMainWindow):
         """)
         btn_create.clicked.connect(self.create_new_wallet)
         
-        # Botón de cargar con icono más grande
         btn_load = QPushButton(" Cargar Billetera Existente")
         btn_load.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         btn_load.setIconSize(QSize(24, 24))
@@ -725,7 +889,6 @@ class SolidWalletGUI(QMainWindow):
         widget.setLayout(layout)
         return widget
 
-
     def get_stylesheet(self):
         return """
             QMainWindow { background-color: #f5f7fa; }
@@ -757,7 +920,6 @@ class SolidWalletGUI(QMainWindow):
     def create_app_icon(self):
         return QIcon(":/icons/solidwallet.png")
     
-    
     def setup_left_panel(self):
         left_panel = QWidget()
         left_panel.setFixedWidth(300)
@@ -765,7 +927,6 @@ class SolidWalletGUI(QMainWindow):
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(10)
         
-        # Título con estilo
         title = QLabel("Mis Billeteras")
         title.setStyleSheet("""
             QLabel {
@@ -778,12 +939,10 @@ class SolidWalletGUI(QMainWindow):
         """)
         left_layout.addWidget(title)
         
-        # Contenedor con scroll para la lista de wallets
         scroll_container = QWidget()
         scroll_layout = QVBoxLayout(scroll_container)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Lista de wallets con scroll
         self.wallet_list = QListWidget()
         self.wallet_list.setIconSize(QSize(24, 24))
         self.wallet_list.setStyleSheet("""
@@ -809,7 +968,6 @@ class SolidWalletGUI(QMainWindow):
         self.wallet_list.itemClicked.connect(self.select_wallet)
         self.load_wallet_list()
         
-        # Scroll Area
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setWidget(self.wallet_list)
@@ -832,9 +990,8 @@ class SolidWalletGUI(QMainWindow):
         """)
         
         scroll_layout.addWidget(scroll_area)
-        left_layout.addWidget(scroll_container, 1)  # Ocupa el espacio disponible
+        left_layout.addWidget(scroll_container, 1)
         
-        # Botones
         self.btn_new = QPushButton("Nueva Billetera")
         self.btn_new.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
         self.btn_new.setStyleSheet("""
@@ -889,7 +1046,6 @@ class SolidWalletGUI(QMainWindow):
         left_panel.setLayout(left_layout)
         self.main_layout.addWidget(left_panel)
         
-        
     def delete_selected_wallet(self):
         selected = self.wallet_list.currentItem()
         if not selected:
@@ -915,34 +1071,13 @@ class SolidWalletGUI(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"No se pudo eliminar: {str(e)}")
 
-    def setup_right_panel(self):
-        # Panel derecho
-        right_panel = QVBoxLayout()
-        right_panel.setSpacing(15)
-        
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-        self.tabs.setStyleSheet("""
-            QTabBar::tab {
-                padding: 8px 15px;
-                border-top-left-radius: 5px;
-                border-top-right-radius: 5px;
-            }
-            QTabBar::tab:selected {
-                background: #ffffff;
-                border-bottom: 3px solid #4e9af1;
-            }
-        """)
-        
-        # --------------------------------------------
-        # Pestaña de Información
-        # --------------------------------------------
-        info_tab = QWidget()
+    def setup_info_tab(self):
+        """Configura la pestaña de información del wallet"""
+        self.info_tab = QWidget()
         info_layout = QVBoxLayout()
         info_layout.setContentsMargins(15, 15, 15, 15)
         info_layout.setSpacing(15)
         
-        # Sección de dirección
         address_group = QGroupBox("Dirección de la Billetera")
         address_layout = QVBoxLayout()
         self.address_label = QLabel("No hay billetera cargada")
@@ -959,7 +1094,6 @@ class SolidWalletGUI(QMainWindow):
         address_layout.addWidget(self.address_label)
         address_group.setLayout(address_layout)
         
-        # Sección de balances
         balances_group = QGroupBox("Balances")
         balances_layout = QFormLayout()
         
@@ -967,14 +1101,19 @@ class SolidWalletGUI(QMainWindow):
         self.usdt_balance = QLabel("0.0")
         self.usdc_balance = QLabel("0.0")
         
+        balance_style = "font-weight: bold; font-size: 14px;"
+        self.bnb_balance.setStyleSheet(balance_style)
+        self.usdt_balance.setStyleSheet(balance_style)
+        self.usdc_balance.setStyleSheet(balance_style)
+        
         balances_layout.addRow(QLabel("BNB:"), self.bnb_balance)
         balances_layout.addRow(QLabel("USDT:"), self.usdt_balance)
         balances_layout.addRow(QLabel("USDC:"), self.usdc_balance)
         balances_group.setLayout(balances_layout)
         
-        # Sección de QR Code
         qr_group = QGroupBox("Código QR para recibir")
         qr_layout = QVBoxLayout()
+        qr_layout.setContentsMargins(0, 0, 0, 20)
         
         self.qr_code_label = QLabel()
         self.qr_code_label.setAlignment(Qt.AlignCenter)
@@ -985,29 +1124,41 @@ class SolidWalletGUI(QMainWindow):
                 border: 1px solid #dee2e6;
                 border-radius: 5px;
                 padding: 10px;
+                margin-bottom: 20px;
             }
         """)
         
         qr_layout.addWidget(self.qr_code_label, 0, Qt.AlignCenter)
         qr_group.setLayout(qr_layout)
         
-        # Agregar widgets a la pestaña de información
         info_layout.addWidget(address_group)
         info_layout.addWidget(balances_group)
         info_layout.addWidget(qr_group)
         info_layout.addStretch()
-        info_tab.setLayout(info_layout)
+        self.info_tab.setLayout(info_layout)
         
-        # --------------------------------------------
-        # Pestaña de Transacciones
-        # --------------------------------------------
-        tx_tab = QWidget()
+        self.tabs.addTab(self.info_tab, QIcon(":/icons/info.svg"), "Información")
+        
+    def setup_tx_tab(self):
+        """Configura la pestaña de historial de transacciones"""
+        self.tx_tab = QWidget()
         tx_layout = QVBoxLayout()
         tx_layout.setContentsMargins(5, 5, 5, 5)
         
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filtrar por moneda:"))
+        
+        self.tx_filter_combo = QComboBox()
+        self.tx_filter_combo.addItems(["Todas", "BNB", "USDT", "USDC"])
+        self.tx_filter_combo.currentIndexChanged.connect(self.update_transaction_history)
+        filter_layout.addWidget(self.tx_filter_combo)
+        filter_layout.addStretch()
+        
+        tx_layout.addLayout(filter_layout)
+        
         self.transaction_table = QTableWidget()
         self.transaction_table.setColumnCount(6)
-        self.transaction_table.setHorizontalHeaderLabels(["Hash", "De", "Para", "Valor", "Token", "Estado"])
+        self.transaction_table.setHorizontalHeaderLabels(["Hash", "Dirección", "Tipo", "Valor", "Moneda", "Estado"])
         self.transaction_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.transaction_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.transaction_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1023,59 +1174,490 @@ class SolidWalletGUI(QMainWindow):
         """)
         
         tx_layout.addWidget(self.transaction_table)
-        tx_tab.setLayout(tx_layout)
+        self.tx_tab.setLayout(tx_layout)
         
-        # --------------------------------------------
-        # Pestaña de Enviar
-        # --------------------------------------------
-        send_tab = QWidget()
-        send_layout = QVBoxLayout()
-        send_layout.setContentsMargins(15, 15, 15, 15)
-        send_layout.setSpacing(15)
+        self.tabs.addTab(self.tx_tab, QIcon(":/icons/history.svg"), "Transacciones")
+
+    def update_transaction_history(self):
+        """Actualiza el historial de transacciones con los datos del wallet actual"""
+        logger.debug("Actualizando historial de transacciones")
         
-        send_form = QFormLayout()
-        send_form.setSpacing(10)
+        if not self.current_wallet:
+            logger.debug("No hay wallet cargado, no se puede actualizar historial")
+            self.transaction_table.setRowCount(0)
+            return
+        
+        self.show_loading()
+        
+        def fetch_transactions():
+            try:
+                transactions = self.current_wallet.get_transactions()
+                
+                selected_token = self.tx_filter_combo.currentText()
+                if selected_token != "Todas":
+                    transactions = [tx for tx in transactions if tx.get('token', 'BNB') == selected_token]
+                
+                return transactions
+            except Exception as e:
+                logger.error(f"Error obteniendo transacciones: {str(e)}")
+                return []
+
+        def update_table(transactions):
+            self.transaction_table.setRowCount(len(transactions))
+            
+            for row, tx in enumerate(transactions):
+                if tx['from'].lower() == self.current_wallet.address.lower():
+                    tx_type = "Enviado"
+                    address = tx['to']
+                    type_color = QColor('#f44336')
+                else:
+                    tx_type = "Recibido"
+                    address = tx['from']
+                    type_color = QColor('#4CAF50')
+                
+                short_hash = tx['hash'][:8] + "..." + tx['hash'][-6:]
+                short_address = address[:6] + "..." + address[-4:]
+                
+                self.transaction_table.setItem(row, 0, QTableWidgetItem(short_hash))
+                self.transaction_table.setItem(row, 1, QTableWidgetItem(short_address))
+                
+                type_item = QTableWidgetItem(tx_type)
+                type_item.setForeground(type_color)
+                self.transaction_table.setItem(row, 2, type_item)
+                
+                value_item = QTableWidgetItem(f"{tx['value']:.6f}")
+                value_item.setForeground(type_color)
+                self.transaction_table.setItem(row, 3, value_item)
+                
+                self.transaction_table.setItem(row, 4, QTableWidgetItem(tx.get('token', 'BNB')))
+                
+                status_item = QTableWidgetItem(tx.get('status', 'pending'))
+                if tx.get('status', '').lower() == 'confirmed':
+                    status_item.setForeground(QColor('#4CAF50'))
+                else:
+                    status_item.setForeground(QColor('#FF9800'))
+                self.transaction_table.setItem(row, 5, status_item)
+            
+            self.show_loading(False)
+            logger.debug(f"Historial actualizado con {len(transactions)} transacciones")
+
+        worker = Worker(fetch_transactions)
+        worker.finished.connect(update_table)
+        worker.error.connect(lambda e: self.show_loading(False))
+        self.active_workers.append(worker)
+        worker.start()
+
+    def setup_send_tab(self):
+        self.send_tab = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        
+        form = QFormLayout()
+        form.setSpacing(10)
         
         self.token_combo = QComboBox()
         self.token_combo.addItems(['BNB', 'USDT', 'USDC'])
-        self.token_combo.setStyleSheet("QComboBox { padding: 5px; }")
+        form.addRow("Token:", self.token_combo)
         
         self.recipient_address = QLineEdit()
-        self.recipient_address.setPlaceholderText("Dirección del destinatario")
+        self.recipient_address.setPlaceholderText("Dirección BSC (0x...)")
+        form.addRow("Para:", self.recipient_address)
         
         self.send_amount = QLineEdit()
         self.send_amount.setPlaceholderText("0.0")
         self.send_amount.setValidator(QDoubleValidator(0, 1000000, 6))
+        form.addRow("Cantidad:", self.send_amount)
         
-        self.gas_limit = QLineEdit("21000")
-        self.gas_limit.setValidator(QIntValidator(21000, 1000000))
+        layout.addLayout(form)
         
-        btn_send = QPushButton("Enviar Transacción")
-        btn_send.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
-        btn_send.setStyleSheet("""
+        fee_group = QGroupBox("Configuración de Tarifas")
+        fee_layout = QVBoxLayout()
+        
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems([
+            "Económica (Baja prioridad)",
+            "Estándar (Prioridad media)",
+            "Rápida (Alta prioridad)",
+            "Urgente (Máxima prioridad)"
+        ])
+        self.speed_combo.currentIndexChanged.connect(self.update_estimated_fee)
+        
+        fee_layout.addWidget(QLabel("Velocidad de transacción:"))
+        fee_layout.addWidget(self.speed_combo)
+        
+        self.fee_label = QLabel("Costo estimado: ~$0.00")
+        self.fee_label.setStyleSheet("color: #666; font-size: 12px;")
+        fee_layout.addWidget(self.fee_label)
+        
+        fee_group.setLayout(fee_layout)
+        layout.addWidget(fee_group)
+        
+        self.advanced_group = QGroupBox("Configuración Avanzada")
+        self.advanced_group.setCheckable(True)
+        self.advanced_group.setChecked(False)
+        self.advanced_group.toggled.connect(self.on_advanced_toggled)
+        advanced_layout = QFormLayout()
+        
+        self.gas_price_input = QLineEdit()
+        self.gas_price_input.setValidator(QDoubleValidator(0.1, 1000, 1))
+        self.gas_price_input.textChanged.connect(self.on_gas_price_changed)
+        
+        self.gas_limit_input = QLineEdit("21000")
+        self.gas_limit_input.setValidator(QIntValidator(21000, 1000000))
+        
+        advanced_layout.addRow("Precio Gas (Gwei):", self.gas_price_input)
+        advanced_layout.addRow("Límite de Gas:", self.gas_limit_input)
+        self.advanced_group.setLayout(advanced_layout)
+        layout.addWidget(self.advanced_group)
+        
+        self.send_button = QPushButton("Enviar Transacción")
+        self.send_button.setStyleSheet("""
             QPushButton {
-                padding: 8px 16px;
+                background-color: #4e9af1;
+                color: white;
+                padding: 10px;
                 font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #3a7bc8;
             }
         """)
-        btn_send.clicked.connect(self.send_transaction)
+        self.send_button.clicked.connect(self.send_transaction)
+        layout.addWidget(self.send_button)
         
-        send_form.addRow("Token:", self.token_combo)
-        send_form.addRow("Destinatario:", self.recipient_address)
-        send_form.addRow("Cantidad:", self.send_amount)
-        send_form.addRow("Límite de Gas:", self.gas_limit)
-        send_layout.addLayout(send_form)
-        send_layout.addWidget(btn_send, 0, Qt.AlignRight)
-        send_layout.addStretch()
-        send_tab.setLayout(send_layout)
+        self.send_tab.setLayout(layout)
+        self.tabs.addTab(self.send_tab, QIcon(":/icons/send.svg"), "Enviar")
+
+    def on_advanced_toggled(self, checked):
+        """Maneja el cambio en el estado del grupo avanzado"""
+        if checked:
+            speed_names = ['low', 'medium', 'high', 'urgent']
+            speed = speed_names[self.speed_combo.currentIndex()]
+            gas_params = self.current_wallet.calculate_optimal_gas(
+                self.token_combo.currentText(),
+                speed
+            )
+            self.gas_price_input.setText(str(gas_params['gas_price']))
+            self.gas_limit_input.setText(str(gas_params['gas_limit']))
+        self.update_estimated_fee()
+
+    def update_estimated_fee(self):
+        """Actualiza la estimación de tarifa basada en los parámetros actuales"""
+        try:
+            if not self.online:
+                raise ConnectionError("Sin conexión")
+                
+            if not hasattr(self, 'current_wallet') or not self.current_wallet:
+                return
+                
+            if self.advanced_group.isChecked():
+                try:
+                    gas_price = float(self.gas_price_input.text())
+                    gas_limit = int(self.gas_limit_input.text())
+                    speed = "Manual"
+                except ValueError:
+                    return
+            else:
+                speed_names = ['low', 'medium', 'high', 'urgent']
+                speed = speed_names[self.speed_combo.currentIndex()]
+                gas_params = self.current_wallet.calculate_optimal_gas(
+                    self.token_combo.currentText(),
+                    speed
+                )
+                gas_price = gas_params['gas_price']
+                gas_limit = gas_params['gas_limit']
+            
+            fee_bnb = (gas_limit * gas_price) / 1e9
+            fee_usd = fee_bnb * self.bnb_price
+            
+            self.fee_label.setText(
+                f"Costo estimado: {fee_bnb:.6f} BNB (~${fee_usd:.2f} USD)\n"
+                f"Velocidad: {speed} (~{self.get_time_estimate(gas_price)})"
+            )
+                
+        except Exception as e:
+            logger.error(f"Error actualizando fee: {str(e)}")
+            self.fee_label.setText("Error calculando tarifa")
+    
+    def get_time_estimate(self, gas_price):
+        """Estima tiempo de confirmación con base en el gas price"""
+        if not hasattr(self, 'current_gas_prices'):
+            return "N/A"
         
-        # Agregar pestañas al widget principal
-        self.tabs.addTab(info_tab, QIcon(":/icons/info.svg"), "Información")
-        self.tabs.addTab(tx_tab, QIcon(":/icons/history.svg"), "Transacciones")
-        self.tabs.addTab(send_tab, QIcon(":/icons/send.svg"), "Enviar")
+        if gas_price >= self.current_gas_prices.get('urgent', 20):
+            return "< 1 minuto"
+        elif gas_price >= self.current_gas_prices.get('high', 10):
+            return "1-2 minutos"
+        elif gas_price >= self.current_gas_prices.get('medium', 5):
+            return "2-5 minutos"
+        else:
+            return "5+ minutos"
+
+    def get_bnb_price(self):
+        """Obtiene el precio actual de BNB en USD usando TradingView con manejo de errores"""
+        if not self.online:
+            raise ConnectionError("No hay conexión a internet")
         
-        right_panel.addWidget(self.tabs)
-        self.main_layout.addLayout(right_panel, 1)
+        try:
+            import requests
+            from requests.exceptions import RequestException
+            
+            url = "https://scanner.tradingview.com/crypto/scan"
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "filter": [{"left": "name", "operation": "equal", "right": "BNBUSDT"}],
+                "options": {"lang": "en"},
+                "symbols": {"query": {"types": []}, "tickers": []},
+                "columns": ["close"],
+                "sort": {"sortBy": "name", "sortOrder": "asc"},
+                "range": [0, 1]
+            }
+
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=5)
+                response.raise_for_status()
+                
+                data = response.json()
+                if data and 'data' in data and len(data['data']) > 0:
+                    return float(data['data'][0]['d'][0])
+                
+                raise ValueError("Datos de TradingView no válidos")
+                
+            except RequestException as e:
+                logger.error(f"Error de red al obtener precio: {str(e)}")
+                raise ConnectionError("Error al conectar con TradingView") from e
+            except ValueError as e:
+                logger.error(f"Datos inválidos de TradingView: {str(e)}")
+                raise ValueError("No se pudo obtener el precio de BNB") from e
+                
+        except Exception as e:
+            logger.error(f"Error inesperado en get_bnb_price: {str(e)}")
+            raise
+
+    def on_gas_price_changed(self):
+        """Cuando el usuario modifica manualmente el gas price"""
+        if self.advanced_group.isChecked() and self.gas_price_input.text():
+            try:
+                gas_price = float(self.gas_price_input.text())
+                self.update_estimated_fee()
+            except ValueError:
+                pass
+
+    def cleanup_workers(self):
+        for worker in self.active_workers[:]:
+            if worker.isFinished():
+                try:
+                    worker.stop()
+                    worker.deleteLater()
+                    self.active_workers.remove(worker)
+                except Exception as e:
+                    logger.error(f"Error limpiando worker: {str(e)}")
+
+    def select_wallet(self, item):
+        self.update_last_activity()
+        file_path = item.data(Qt.UserRole)
+        
+        if file_path == self.current_file:
+            return
+        
+        if self.current_wallet:
+            self.logout()
+        
+        result, password = self.create_password_dialog(
+            "Contraseña", 
+            f"Ingrese la contraseña para {os.path.basename(file_path)}:"
+        )
+        
+        if not result or not password:
+            return
+        
+        self.show_loading()
+        
+        worker = Worker(self.wallet_manager.decrypt_wallet, file_path, password)
+        worker.finished.connect(lambda w: self.on_wallet_selected(w, file_path))
+        worker.error.connect(self.on_wallet_select_error)
+        self.active_workers.append(worker)
+        worker.start()
+
+    def on_wallet_selected(self, wallet, file_path):
+        self.show_loading(False)
+        self.current_wallet = wallet
+        self.current_file = file_path
+        
+        if file_path not in self.wallet_manager.wallet_files:
+            self.wallet_manager.wallet_files.append(file_path)
+            self.wallet_manager.save_wallet_files()
+            self.load_wallet_list()
+        
+        for i in range(self.wallet_list.count()):
+            item = self.wallet_list.item(i)
+            if item.data(Qt.UserRole) == file_path:
+                item.setSelected(True)
+                break
+        
+        self.update_wallet_info()
+        self.cleanup_workers()
+        
+        self.stacked_widget.setCurrentIndex(0)
+    
+    def on_wallet_select_error(self, error):
+        logger.error(f"Error al seleccionar wallet: {error}")
+        self.show_loading(False)
+        QMessageBox.critical(self, "Error", f"No se pudo cargar la billetera: {error}")
+        self.cleanup_workers()
+
+    def update_wallet_info(self):
+        logger.debug("Actualizando información del wallet")
+        if not self.current_wallet:
+            logger.debug("No hay wallet cargado, mostrando estado inicial")
+            self.show_empty_state()
+            return
+        
+        self.show_wallet_state()
+        self.address_label.setText(self.current_wallet.address)
+        self.generate_qr_code(self.current_wallet.address)
+        
+        self.show_loading()
+        
+        def fetch_wallet_data():
+            try:
+                logger.debug("Obteniendo datos del wallet")
+                bnb = self.current_wallet.get_balance('BNB')
+                usdt = self.current_wallet.get_balance('USDT')
+                usdc = self.current_wallet.get_balance('USDC')
+                txs = self.current_wallet.get_transactions()
+                return {
+                    'bnb': bnb,
+                    'usdt': usdt,
+                    'usdc': usdc,
+                    'txs': txs
+                }
+            except Exception as e:
+                logger.error(f"Error obteniendo datos: {e}")
+                return None
+
+        def update_ui(data):
+            if data is None:
+                QMessageBox.warning(self, "Error", "No se pudieron obtener los datos del wallet")
+                return
+                
+            self.bnb_balance.setText(f"{data['bnb']:.6f}" if data['bnb'] is not None else "Error")
+            self.usdt_balance.setText(f"{data['usdt']:.6f}" if data['usdt'] is not None else "Error")
+            self.usdc_balance.setText(f"{data['usdc']:.6f}" if data['usdc'] is not None else "Error")
+            
+            self.transaction_table.setRowCount(len(data['txs']))
+            for row, tx in enumerate(data['txs']):
+                self.transaction_table.setItem(row, 0, QTableWidgetItem(tx['hash'][:16] + "..."))
+                self.transaction_table.setItem(row, 1, QTableWidgetItem(tx['from']))
+                self.transaction_table.setItem(row, 2, QTableWidgetItem(tx['to']))
+                self.transaction_table.setItem(row, 3, QTableWidgetItem(f"{tx['value']:.6f}"))
+                self.transaction_table.setItem(row, 4, QTableWidgetItem(tx.get('token', 'BNB')))
+                self.transaction_table.setItem(row, 5, QTableWidgetItem(tx['status']))
+            
+            self.show_loading(False)
+
+        worker = Worker(fetch_wallet_data)
+        worker.finished.connect(update_ui)
+        worker.error.connect(lambda e: self.show_loading(False))
+        self.active_workers.append(worker)
+        worker.start()
+
+    def generate_qr_code(self, address):
+        try:
+            logger.debug(f"Generando QR code para dirección: {address}")
+            
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(address)
+            qr.make(fit=True)
+            
+            img = qr.make_image(
+                fill_color="#4e9af1",
+                back_color="#ffffff"
+            )
+            
+            img = img.convert("RGBA")
+            data = img.tobytes("raw", "RGBA")
+            qimg = QImage(
+                data, 
+                img.size[0], 
+                img.size[1], 
+                QImage.Format_RGBA8888
+            )
+            
+            pixmap = QPixmap.fromImage(qimg)
+            
+            final_pixmap = QPixmap(pixmap.size())
+            final_pixmap.fill(Qt.transparent)
+            
+            painter = QPainter(final_pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            
+            shadow = QPainterPath()
+            shadow.addRoundedRect(QRectF(5, 5, pixmap.width(), pixmap.height()), 10, 10)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 50))
+            painter.drawPath(shadow)
+            
+            bg_path = QPainterPath()
+            bg_path.addRoundedRect(QRectF(0, 0, pixmap.width(), pixmap.height()), 10, 10)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(Qt.white)
+            painter.drawPath(bg_path)
+            
+            painter.drawPixmap(0, 0, pixmap)
+            painter.end()
+            
+            final_pixmap = final_pixmap.scaled(
+                self.qr_code_label.width(),
+                self.qr_code_label.height(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            
+            self.qr_code_label.setPixmap(final_pixmap)
+            logger.debug("QR code generado exitosamente con estilo mejorado")
+            
+        except Exception as e:
+            logger.error(f"Error generando QR mejorado: {str(e)}\n{traceback.format_exc()}")
+            try:
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_L,
+                    box_size=8,
+                    border=2,
+                )
+                qr.add_data(address)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                img_bytes = img.tobytes()
+                qimage = QImage(
+                    img_bytes, 
+                    img.size[0], 
+                    img.size[1], 
+                    QImage.Format_Grayscale8
+                )
+                pixmap = QPixmap.fromImage(qimage)
+                pixmap = pixmap.scaled(
+                    self.qr_code_label.width(),
+                    self.qr_code_label.height(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.qr_code_label.setPixmap(pixmap)
+            except:
+                self.qr_code_label.clear()
+                self.qr_code_label.setText("Error generando QR")
+                self.qr_code_label.setStyleSheet("color: red; font-weight: bold;")
 
     def show_loading(self, show=True):
         if show:
@@ -1084,7 +1666,6 @@ class SolidWalletGUI(QMainWindow):
         else:
             self.stacked_widget.setCurrentIndex(0)
             self.loading_widget.setVisible(False)
-
     
     def update_last_activity(self):
         self.last_activity = datetime.now()
@@ -1094,7 +1675,6 @@ class SolidWalletGUI(QMainWindow):
             logger.info("Sesión expirada por inactividad")
             QMessageBox.information(self, "Sesión expirada", "Su sesión ha expirado por inactividad.")
             self.logout()
-
     
     def logout(self):
         logger.debug("Cerrando sesión")
@@ -1127,7 +1707,6 @@ class SolidWalletGUI(QMainWindow):
         password_edit.setEchoMode(QLineEdit.Password)
         layout.addWidget(password_edit)
         
-        # Contenedor para el botón de mostrar/ocultar
         toggle_container = QWidget()
         toggle_layout = QHBoxLayout(toggle_container)
         toggle_layout.setContentsMargins(0, 0, 0, 0)
@@ -1148,7 +1727,6 @@ class SolidWalletGUI(QMainWindow):
         toggle_layout.addWidget(toggle_button, 0, Qt.AlignRight)
         layout.addWidget(toggle_container)
         
-        # Botones de aceptar/cancelar
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
@@ -1162,7 +1740,6 @@ class SolidWalletGUI(QMainWindow):
         self.update_last_activity()
         logger.debug("Iniciando creación de nuevo wallet")
         
-        # Paso 1: Pedir contraseña
         result, password = self.create_password_dialog(
             "Contraseña", 
             "Ingrese una contraseña segura para cifrar la billetera:"
@@ -1172,7 +1749,6 @@ class SolidWalletGUI(QMainWindow):
             logger.debug("Creación de wallet cancelada por el usuario")
             return
         
-        # Validar contraseña segura
         if len(password) < 8:
             self.show_password_error("La contraseña debe tener al menos 8 caracteres.")
             return
@@ -1185,7 +1761,6 @@ class SolidWalletGUI(QMainWindow):
             self.show_password_error("La contraseña debe contener al menos un número.")
             return
         
-        # Paso 2: Confirmar contraseña
         result, confirm_password = self.create_password_dialog(
             "Confirmar Contraseña", 
             "Vuelva a ingresar la contraseña para confirmar:"
@@ -1195,7 +1770,6 @@ class SolidWalletGUI(QMainWindow):
             self.show_password_error("Las contraseñas no coinciden.")
             return
         
-        # Crear wallet
         wallet = self.wallet_manager.create_wallet()
         
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1256,7 +1830,6 @@ class SolidWalletGUI(QMainWindow):
         self.update_last_activity()
         logger.debug("Iniciando carga de wallet")
         
-        # Eliminamos la verificación de wallet_files para permitir cargar cualquier archivo
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Abrir Billetera", 
             "", "Billetera Cripto (*.cwallet)"
@@ -1290,7 +1863,6 @@ class SolidWalletGUI(QMainWindow):
         self.current_wallet = wallet
         self.current_file = file_path
         
-        # Si el archivo no estaba en la lista, agregarlo
         if file_path not in self.wallet_manager.wallet_files:
             self.wallet_manager.wallet_files.append(file_path)
             self.wallet_manager.save_wallet_files()
@@ -1299,638 +1871,145 @@ class SolidWalletGUI(QMainWindow):
         self.update_wallet_info()
         self.cleanup_workers()
     
-    def on_wallet_load_error(self, error, show_main=False):
+    def on_wallet_load_error(self, error):
         logger.error(f"Error al cargar wallet: {error}")
         self.show_loading(False)
         QMessageBox.critical(self, "Error", f"No se pudo cargar la billetera: {error}")
-        
-        if show_main:
-            self.stacked_widget.setCurrentIndex(0)
-            self.update_wallet_info()
-        
         self.cleanup_workers()
-    
 
-    def setup_info_tab(self):
-        """Configura la pestaña de información del wallet"""
-        self.info_tab = QWidget()
-        info_layout = QVBoxLayout()
-        info_layout.setContentsMargins(15, 15, 15, 15)
-        info_layout.setSpacing(15)
-        
-        # Sección de dirección
-        address_group = QGroupBox("Dirección de la Billetera")
-        address_layout = QVBoxLayout()
-        self.address_label = QLabel("No hay billetera cargada")
-        self.address_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.address_label.setStyleSheet("""
-            QLabel {
-                font-family: monospace; 
-                background-color: #f8f9fa;
-                padding: 10px;
-                border-radius: 5px;
-                border: 1px solid #dee2e6;
-            }
-        """)
-        address_layout.addWidget(self.address_label)
-        address_group.setLayout(address_layout)
-        
-        # Sección de balances
-        balances_group = QGroupBox("Balances")
-        balances_layout = QFormLayout()
-        
-        self.bnb_balance = QLabel("0.0")
-        self.usdt_balance = QLabel("0.0")
-        self.usdc_balance = QLabel("0.0")
-        
-        # Estilo para los balances
-        balance_style = "font-weight: bold; font-size: 14px;"
-        self.bnb_balance.setStyleSheet(balance_style)
-        self.usdt_balance.setStyleSheet(balance_style)
-        self.usdc_balance.setStyleSheet(balance_style)
-        
-        balances_layout.addRow(QLabel("BNB:"), self.bnb_balance)
-        balances_layout.addRow(QLabel("USDT:"), self.usdt_balance)
-        balances_layout.addRow(QLabel("USDC:"), self.usdc_balance)
-        balances_group.setLayout(balances_layout)
-        
-        # Sección de QR Code con margen inferior
-        qr_group = QGroupBox("Código QR para recibir")
-        qr_layout = QVBoxLayout()
-        qr_layout.setContentsMargins(0, 0, 0, 20)  # Margen inferior de 20px
-        
-        self.qr_code_label = QLabel()
-        self.qr_code_label.setAlignment(Qt.AlignCenter)
-        self.qr_code_label.setFixedSize(250, 250)
-        self.qr_code_label.setStyleSheet("""
-            QLabel {
-                background-color: white;
-                border: 1px solid #dee2e6;
-                border-radius: 5px;
-                padding: 10px;
-                margin-bottom: 20px;  /* Margen adicional */
-            }
-        """)
-        
-        qr_layout.addWidget(self.qr_code_label, 0, Qt.AlignCenter)
-        qr_group.setLayout(qr_layout)
-        
-        # Agregar widgets a la pestaña de información
-        info_layout.addWidget(address_group)
-        info_layout.addWidget(balances_group)
-        info_layout.addWidget(qr_group)
-        info_layout.addStretch()
-        self.info_tab.setLayout(info_layout)
-        
-        # Agregar la pestaña al tab widget
-        self.tabs.addTab(self.info_tab, QIcon(":/icons/info.svg"), "Información")
-        
-    def setup_tx_tab(self):
-        """Configura la pestaña de historial de transacciones"""
-        self.tx_tab = QWidget()
-        tx_layout = QVBoxLayout()
-        tx_layout.setContentsMargins(5, 5, 5, 5)
-        
-        # Filtro por moneda
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("Filtrar por moneda:"))
-        
-        self.tx_filter_combo = QComboBox()
-        self.tx_filter_combo.addItems(["Todas", "BNB", "USDT", "USDC"])
-        self.tx_filter_combo.currentIndexChanged.connect(self.update_transaction_history)
-        filter_layout.addWidget(self.tx_filter_combo)
-        filter_layout.addStretch()
-        
-        tx_layout.addLayout(filter_layout)
-        
-        # Tabla de transacciones
-        self.transaction_table = QTableWidget()
-        self.transaction_table.setColumnCount(6)
-        self.transaction_table.setHorizontalHeaderLabels(["Hash", "Dirección", "Tipo", "Valor", "Moneda", "Estado"])
-        self.transaction_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.transaction_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.transaction_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.transaction_table.setStyleSheet("""
-            QTableWidget {
-                alternate-background-color: #f8f9fa;
-            }
-            QHeaderView::section {
-                background-color: #e9ecef;
-                padding: 5px;
-                border: none;
-            }
-        """)
-        
-        tx_layout.addWidget(self.transaction_table)
-        self.tx_tab.setLayout(tx_layout)
-        
-        # Agregar la pestaña al tab widget con su icono
-        self.tabs.addTab(self.tx_tab, QIcon(":/icons/history.svg"), "Transacciones")
-        
-
-    def update_transaction_history(self):
-        """Actualiza el historial de transacciones con los datos del wallet actual"""
-        logger.debug("Actualizando historial de transacciones")
-        
-        if not self.current_wallet:
-            logger.debug("No hay wallet cargado, no se puede actualizar historial")
-            self.transaction_table.setRowCount(0)
-            return
-        
-        self.show_loading()
-        
-        def fetch_transactions():
-            try:
-                # Obtener transacciones del wallet
-                transactions = self.current_wallet.get_transactions()
-                
-                # Aplicar filtro si está seleccionado
-                selected_token = self.tx_filter_combo.currentText()
-                if selected_token != "Todas":
-                    transactions = [tx for tx in transactions if tx.get('token', 'BNB') == selected_token]
-                
-                return transactions
-            except Exception as e:
-                logger.error(f"Error obteniendo transacciones: {str(e)}")
-                return []
-
-        def update_table(transactions):
-            self.transaction_table.setRowCount(len(transactions))
-            
-            for row, tx in enumerate(transactions):
-                # Determinar tipo de transacción (Enviado/Recibido)
-                if tx['from'].lower() == self.current_wallet.address.lower():
-                    tx_type = "Enviado"
-                    address = tx['to']
-                    type_color = QColor('#f44336')  # Rojo
-                else:
-                    tx_type = "Recibido"
-                    address = tx['from']
-                    type_color = QColor('#4CAF50')  # Verde
-                
-                # Acortar hash y dirección para mejor visualización
-                short_hash = tx['hash'][:8] + "..." + tx['hash'][-6:]
-                short_address = address[:6] + "..." + address[-4:]
-                
-                # Crear items para la tabla
-                self.transaction_table.setItem(row, 0, QTableWidgetItem(short_hash))
-                self.transaction_table.setItem(row, 1, QTableWidgetItem(short_address))
-                
-                type_item = QTableWidgetItem(tx_type)
-                type_item.setForeground(type_color)
-                self.transaction_table.setItem(row, 2, type_item)
-                
-                value_item = QTableWidgetItem(f"{tx['value']:.6f}")
-                value_item.setForeground(type_color)
-                self.transaction_table.setItem(row, 3, value_item)
-                
-                self.transaction_table.setItem(row, 4, QTableWidgetItem(tx.get('token', 'BNB')))
-                
-                # Estado con color según confirmación
-                status_item = QTableWidgetItem(tx.get('status', 'pending'))
-                if tx.get('status', '').lower() == 'confirmed':
-                    status_item.setForeground(QColor('#4CAF50'))  # Verde
-                else:
-                    status_item.setForeground(QColor('#FF9800'))  # Amarillo/naranja
-                self.transaction_table.setItem(row, 5, status_item)
-            
-            self.show_loading(False)
-            logger.debug(f"Historial actualizado con {len(transactions)} transacciones")
-
-        # Usar Worker para la operación en segundo plano
-        worker = Worker(fetch_transactions)
-        worker.finished.connect(update_table)
-        worker.error.connect(lambda e: self.show_loading(False))
-        self.active_workers.append(worker)
-        worker.start()
-
-    def setup_send_tab(self):
-        """Configura la pestaña para enviar transacciones"""
-        self.send_tab = QWidget()
-        send_layout = QVBoxLayout()
-        send_layout.setContentsMargins(20, 20, 20, 20)
-        send_layout.setSpacing(15)
-
-        # Grupo para el formulario de envío
-        send_group = QGroupBox("Enviar Fondos")
-        send_group.setStyleSheet("QGroupBox { font-weight: bold; }")
-        form_layout = QFormLayout()
-        form_layout.setSpacing(10)
-
-        # Selector de token
-        self.token_combo = QComboBox()
-        self.token_combo.addItems(['BNB', 'USDT', 'USDC'])
-        self.token_combo.setStyleSheet("""
-            QComboBox {
-                padding: 8px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }
-        """)
-
-        # Campo de dirección destino
-        self.recipient_address = QLineEdit()
-        self.recipient_address.setPlaceholderText("Dirección BSC del destinatario")
-        self.recipient_address.setStyleSheet("""
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }
-        """)
-
-        # Campo de cantidad
-        self.send_amount = QLineEdit()
-        self.send_amount.setPlaceholderText("0.0")
-        self.send_amount.setValidator(QDoubleValidator(0, 1000000, 6))
-        self.send_amount.setStyleSheet("""
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }
-        """)
-
-        # Configuración avanzada (colapsable)
-        self.advanced_group = QGroupBox("Configuración Avanzada")
-        self.advanced_group.setCheckable(True)
-        self.advanced_group.setChecked(False)
-        self.advanced_group.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                margin-top: 10px;
-            }
-            QGroupBox::indicator {
-                width: 16px;
-                height: 16px;
-            }
-        """)
-        
-        advanced_layout = QFormLayout()
-        
-        # Límite de gas
-        self.gas_limit = QLineEdit("21000")
-        self.gas_limit.setValidator(QIntValidator(21000, 1000000))
-        self.gas_limit.setStyleSheet("""
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }
-        """)
-        
-        advanced_layout.addRow("Límite de Gas:", self.gas_limit)
-        self.advanced_group.setLayout(advanced_layout)
-
-        # Botón de envío
-        self.send_button = QPushButton("Enviar Transacción")
-        self.send_button.setIcon(QIcon(":/icons/send.svg"))
-        self.send_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4e9af1;
-                color: white;
-                padding: 10px 20px;
-                border-radius: 5px;
-                font-weight: bold;
-                min-width: 200px;
-            }
-            QPushButton:hover {
-                background-color: #3a7bc8;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.send_button.clicked.connect(self.send_transaction)
-
-        # Agregar elementos al formulario
-        form_layout.addRow("Token:", self.token_combo)
-        form_layout.addRow("Destinatario:", self.recipient_address)
-        form_layout.addRow("Cantidad:", self.send_amount)
-        
-        # Agregar elementos al layout principal
-        send_group.setLayout(form_layout)
-        send_layout.addWidget(send_group)
-        send_layout.addWidget(self.advanced_group)
-        send_layout.addWidget(self.send_button, 0, Qt.AlignCenter)
-        send_layout.addStretch()
-
-        self.send_tab.setLayout(send_layout)
-        
-        # Agregar la pestaña al tab widget
-        self.tabs.addTab(self.send_tab, QIcon(":/icons/send.svg"), "Enviar")
-        
-    def cleanup_workers(self):
-        for worker in self.active_workers[:]:
-            if worker.isFinished():
-                try:
-                    worker.stop()
-                    worker.deleteLater()
-                    self.active_workers.remove(worker)
-                except Exception as e:
-                    logger.error(f"Error limpiando worker: {str(e)}")
-                    
-
-    def select_wallet(self, item):
-        self.update_last_activity()
-        file_path = item.data(Qt.UserRole)
-        
-        if file_path == self.current_file:
-            return
-        
-        # Desconectar primero si hay una wallet conectada
-        if self.current_wallet:
-            self.logout()
-        
-        result, password = self.create_password_dialog(
-            "Contraseña", 
-            f"Ingrese la contraseña para {os.path.basename(file_path)}:"
+    def show_connectivity_error(self):
+        """Muestra error de conectividad"""
+        QMessageBox.critical(
+            self, 
+            "Sin conexión", 
+            "No se puede conectar a internet. Esta operación requiere conexión a la red."
         )
-        
-        if not result or not password:
-            return
-        
-        self.show_loading()
-        
-        worker = Worker(self.wallet_manager.decrypt_wallet, file_path, password)
-        worker.finished.connect(lambda w: self.on_wallet_selected(w, file_path))
-        worker.error.connect(self.on_wallet_select_error)
-        self.active_workers.append(worker)
-        worker.start()
 
-
-    def on_wallet_selected(self, wallet, file_path):
-        self.show_loading(False)
-        self.current_wallet = wallet
-        self.current_file = file_path
+    def show_error_message(self, message):
+        """Muestra mensajes de error con íconos más grandes"""
+        msg = QMessageBox(self)
         
-        # Actualizar lista si es necesario
-        if file_path not in self.wallet_manager.wallet_files:
-            self.wallet_manager.wallet_files.append(file_path)
-            self.wallet_manager.save_wallet_files()
-            self.load_wallet_list()
+        warning_icon = QIcon(":/icons/warning.svg")
+        msg.setIconPixmap(warning_icon.pixmap(QSize(48, 48)))
         
-        # Resaltar el wallet seleccionado en la lista
-        for i in range(self.wallet_list.count()):
-            item = self.wallet_list.item(i)
-            if item.data(Qt.UserRole) == file_path:
-                item.setSelected(True)
-                break
+        msg.setWindowTitle("Error")
+        msg.setText(message)
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec_()
         
-        # Forzar la actualización de la UI
-        self.update_wallet_info()
-        self.cleanup_workers()
-        
-        # Cambiar a la vista principal
-        self.stacked_widget.setCurrentIndex(0)
-    
-    def on_wallet_select_error(self, error):
-        logger.error(f"Error al seleccionar wallet: {error}")
-        self.show_loading(False)
-        QMessageBox.critical(self, "Error", f"No se pudo cargar la billetera: {error}")
-        self.cleanup_workers()
-    
-
-    def update_wallet_info(self):
-        logger.debug("Actualizando información del wallet")
-        if not self.current_wallet:
-            logger.debug("No hay wallet cargado, mostrando estado inicial")
-            self.show_empty_state()
-            return
-        
-        # Mostrar la interfaz de wallet conectado
-        self.show_wallet_state()
-        
-        # Actualizar dirección
-        self.address_label.setText(self.current_wallet.address)
-        
-        # Generar QR code
-        self.generate_qr_code(self.current_wallet.address)
-        
-        self.show_loading()
-        
-        def fetch_wallet_data():
-            try:
-                logger.debug("Obteniendo datos del wallet")
-                bnb = self.current_wallet.get_balance('BNB')
-                usdt = self.current_wallet.get_balance('USDT')
-                usdc = self.current_wallet.get_balance('USDC')
-                txs = self.current_wallet.get_transactions()
-                return {
-                    'bnb': bnb,
-                    'usdt': usdt,
-                    'usdc': usdc,
-                    'txs': txs
-                }
-            except Exception as e:
-                logger.error(f"Error obteniendo datos: {e}")
-                return None
-
-        def update_ui(data):
-            if data is None:
-                QMessageBox.warning(self, "Error", "No se pudieron obtener los datos del wallet")
-                return
-                
-            # Actualizar balances
-            self.bnb_balance.setText(f"{data['bnb']:.6f}" if data['bnb'] is not None else "Error")
-            self.usdt_balance.setText(f"{data['usdt']:.6f}" if data['usdt'] is not None else "Error")
-            self.usdc_balance.setText(f"{data['usdc']:.6f}" if data['usdc'] is not None else "Error")
-            
-            # Actualizar transacciones
-            self.transaction_table.setRowCount(len(data['txs']))
-            for row, tx in enumerate(data['txs']):
-                self.transaction_table.setItem(row, 0, QTableWidgetItem(tx['hash'][:16] + "..."))
-                self.transaction_table.setItem(row, 1, QTableWidgetItem(tx['from']))
-                self.transaction_table.setItem(row, 2, QTableWidgetItem(tx['to']))
-                self.transaction_table.setItem(row, 3, QTableWidgetItem(f"{tx['value']:.6f}"))
-                self.transaction_table.setItem(row, 4, QTableWidgetItem(tx.get('token', 'BNB')))
-                self.transaction_table.setItem(row, 5, QTableWidgetItem(tx['status']))
-            
-            self.show_loading(False)
-
-        worker = Worker(fetch_wallet_data)
-        worker.finished.connect(update_ui)
-        worker.error.connect(lambda e: self.show_loading(False))
-        self.active_workers.append(worker)
-        worker.start()
-
-    def generate_qr_code(self, address):
-        try:
-            logger.debug(f"Generando QR code para dirección: {address}")
-            
-            # 1. Configuración del QR
-            qr = qrcode.QRCode(
-                version=1,
-                error_correction=qrcode.constants.ERROR_CORRECT_H,
-                box_size=10,
-                border=4,
-            )
-            qr.add_data(address)
-            qr.make(fit=True)
-            
-            # 2. Crear imagen PIL
-            img = qr.make_image(
-                fill_color="#4e9af1",  # Color azul que coincide con el tema
-                back_color="#ffffff"   # Fondo blanco
-            )
-            
-            # 3. Convertir PIL Image a QImage
-            img = img.convert("RGBA")
-            data = img.tobytes("raw", "RGBA")
-            qimg = QImage(
-                data, 
-                img.size[0], 
-                img.size[1], 
-                QImage.Format_RGBA8888
-            )
-            
-            # 4. Crear QPixmap y escalar
-            pixmap = QPixmap.fromImage(qimg)
-            
-            # 5. Aplicar efectos visuales
-            final_pixmap = QPixmap(pixmap.size())
-            final_pixmap.fill(Qt.transparent)
-            
-            painter = QPainter(final_pixmap)
-            painter.setRenderHint(QPainter.Antialiasing)
-            
-            # Dibujar sombra
-            shadow = QPainterPath()
-            shadow.addRoundedRect(QRectF(5, 5, pixmap.width(), pixmap.height()), 10, 10)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 50))
-            painter.drawPath(shadow)
-            
-            # Dibujar fondo blanco redondeado
-            bg_path = QPainterPath()
-            bg_path.addRoundedRect(QRectF(0, 0, pixmap.width(), pixmap.height()), 10, 10)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(Qt.white)
-            painter.drawPath(bg_path)
-            
-            # Dibujar el QR
-            painter.drawPixmap(0, 0, pixmap)
-            painter.end()
-            
-            # 6. Escalar manteniendo calidad
-            final_pixmap = final_pixmap.scaled(
-                self.qr_code_label.width(),
-                self.qr_code_label.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            
-            # 7. Mostrar en el label
-            self.qr_code_label.setPixmap(final_pixmap)
-            logger.debug("QR code generado exitosamente con estilo mejorado")
-            
-        except Exception as e:
-            logger.error(f"Error generando QR mejorado: {str(e)}\n{traceback.format_exc()}")
-            # Fallback al método simple si hay error
-            try:
-                qr = qrcode.QRCode(
-                    version=1,
-                    error_correction=qrcode.constants.ERROR_CORRECT_L,
-                    box_size=8,
-                    border=2,
-                )
-                qr.add_data(address)
-                qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-                img_bytes = img.tobytes()
-                qimage = QImage(
-                    img_bytes, 
-                    img.size[0], 
-                    img.size[1], 
-                    QImage.Format_Grayscale8
-                )
-                pixmap = QPixmap.fromImage(qimage)
-                pixmap = pixmap.scaled(
-                    self.qr_code_label.width(),
-                    self.qr_code_label.height(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-                self.qr_code_label.setPixmap(pixmap)
-            except:
-                self.qr_code_label.clear()
-                self.qr_code_label.setText("Error generando QR")
-                self.qr_code_label.setStyleSheet("color: red; font-weight: bold;")           
-
-    def showEvent(self, event):
-        """Evento que se dispara cuando la ventana se muestra"""
-        super().showEvent(event)
-        pass
-
-    
     def send_transaction(self):
+        """Método para enviar transacción con validación de conectividad"""
         self.update_last_activity()
-        logger.debug("Preparando envío de transacción")
         
+        if not self.online:
+            self.show_connectivity_error()
+            return
+
         if not self.current_wallet:
-            QMessageBox.warning(self, "Advertencia", "No hay billetera cargada.")
+            QMessageBox.critical(self, "Error", "No hay billetera cargada")
             return
         
         recipient = self.recipient_address.text().strip()
         amount_text = self.send_amount.text().strip()
         token = self.token_combo.currentText()
-        gas_limit_text = self.gas_limit.text().strip()
         
-        if not recipient or not amount_text or not gas_limit_text:
-            QMessageBox.warning(self, "Advertencia", "Por favor complete todos los campos.")
+        if not recipient or not amount_text:
+            QMessageBox.warning(self, "Advertencia", "Complete todos los campos requeridos.")
             return
         
         try:
             amount = float(amount_text)
-            gas_limit = int(gas_limit_text)
-            
-            if amount <= 0 or gas_limit <= 0:
-                raise ValueError("Valores deben ser positivos")
-        except ValueError as e:
-            QMessageBox.warning(self, "Advertencia", f"Dato inválido: {str(e)}")
+            if amount <= 0:
+                raise ValueError("La cantidad debe ser positiva")
+        except ValueError:
+            QMessageBox.warning(self, "Advertencia", "Cantidad inválida")
             return
         
         if not Web3.is_address(recipient):
             QMessageBox.warning(self, "Advertencia", "Dirección inválida")
             return
         
-        recipient = Web3.to_checksum_address(recipient)
+        try:
+            if self.advanced_group.isChecked():
+                gas_price = float(self.gas_price_input.text())
+                gas_limit = int(self.gas_limit_input.text())
+            else:
+                speed_names = ['low', 'medium', 'high', 'urgent']
+                speed = speed_names[self.speed_combo.currentIndex()]
+                gas_params = self.current_wallet.calculate_optimal_gas(token, speed)
+                gas_price = gas_params['gas_price']
+                gas_limit = gas_params['gas_limit']
+        except ValueError:
+            QMessageBox.warning(self, "Advertencia", "Configuración de gas inválida")
+            return
+        
+        fee_bnb = (gas_limit * gas_price) / 1e9
+        fee_usd = fee_bnb * self.bnb_price
         
         confirm = QMessageBox.question(
             self, "Confirmar", 
-            f"¿Enviar {amount:.6f} {token} a {recipient[:10]}...?",
+            f"¿Enviar {amount:.6f} {token} a {recipient[:10]}...?\n\n"
+            f"Fee estimado: {fee_bnb:.6f} BNB (~${fee_usd:.2f} USD)\n"
+            f"Tiempo estimado: {self.get_time_estimate(gas_price)}",
             QMessageBox.Yes | QMessageBox.No
         )
         
         if confirm != QMessageBox.Yes:
-            logger.debug("Envío de transacción cancelado por el usuario")
             return
         
         self.show_loading()
         
-        worker = Worker(lambda: self.current_wallet.send_transaction(recipient, amount, token, gas_limit))
+        worker = Worker(
+            lambda: self.current_wallet.send_transaction(
+                recipient,
+                amount,
+                token,
+                gas_price=gas_price,
+                gas_limit=gas_limit
+            )
+        )
         worker.finished.connect(self.on_transaction_sent)
         worker.error.connect(self.on_transaction_error)
         self.active_workers.append(worker)
-        logger.debug(f"Iniciando worker para enviar transacción (ID: {id(worker)})")
         worker.start()
 
     def on_transaction_sent(self, tx_hash):
-        logger.debug(f"Transacción enviada exitosamente: {tx_hash}")
+        """Maneja transacción exitosa"""
         self.show_loading(False)
-        QMessageBox.information(self, "Éxito", f"Transacción enviada!\nHash: {tx_hash}")
-        self.recipient_address.clear()
-        self.send_amount.clear()
+        if not self.online:
+            QMessageBox.warning(
+                self, 
+                "Transacción enviada pero sin conexión",
+                f"Transacción enviada con hash: {tx_hash}\n\n"
+                "Pero no hay conexión a internet para confirmar el estado."
+            )
+        else:
+            QMessageBox.information(
+                self, 
+                "Éxito", 
+                f"Transacción enviada!\nHash: {tx_hash}\n\n"
+                "Puedes verificar el estado en BscScan."
+            )
         self.update_wallet_info()
-        self.cleanup_workers()
 
     def on_transaction_error(self, error):
-        logger.error(f"Error al enviar transacción: {error}")
+        """Maneja errores en transacción"""
         self.show_loading(False)
-        QMessageBox.critical(self, "Error", f"No se pudo enviar la transacción: {error}")
-        self.cleanup_workers()
+        
+        if isinstance(error, ConnectionError):
+            self.show_connectivity_error()
+        else:
+            error_msg = str(error)
+            if "insufficient funds" in error_msg.lower():
+                error_msg = "Fondos insuficientes para cubrir el valor + fee de gas"
+            elif "gas" in error_msg.lower():
+                error_msg = "Error en configuración de gas: " + error_msg
+            
+            QMessageBox.critical(
+                self, 
+                "Error en transacción", 
+                f"No se pudo enviar la transacción:\n\n{error_msg}"
+            )
 
 if __name__ == "__main__":
     import sys

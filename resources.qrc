@@ -6,5 +6,8 @@
     <file>icons/send.svg</file>
     <file>icons/loading.svg</file>
     <file>icons/no_wallet.png</file>
+    <file>icons/online.svg</file>
+    <file>icons/offline.svg</file>
+    <file>icons/warning.svg</file>
   </qresource>
 </RCC>
