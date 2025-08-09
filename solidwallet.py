@@ -1255,6 +1255,81 @@ class SolidWalletGUI(QMainWindow):
         # Barra de menú
         self.setup_menu_bar()
 
+    def on_send_button_clicked(self):
+        """Maneja el clic en el botón de enviar"""
+        try:
+            # Obtener valores de los campos
+            token_symbol = self.token_combo.currentText()
+            recipient = self.recipient_address.text().strip()
+            amount_text = self.send_amount.text().strip()
+            
+            # Validaciones básicas
+            if not recipient:
+                QMessageBox.warning(self, "Error", "Ingrese una dirección destino")
+                return
+                
+            if not amount_text:
+                QMessageBox.warning(self, "Error", "Ingrese una cantidad")
+                return
+                
+            try:
+                amount = float(amount_text)
+            except ValueError:
+                QMessageBox.warning(self, "Error", "Cantidad inválida")
+                return
+                
+            if amount <= 0:
+                QMessageBox.warning(self, "Error", "La cantidad debe ser mayor que 0")
+                return
+                
+            # Obtener parámetros de gas
+            if self.advanced_group.isChecked():
+                # Usar valores manuales
+                try:
+                    gas_price = float(self.gas_price_input.text())
+                    gas_limit = int(self.gas_limit_input.text())
+                except ValueError:
+                    QMessageBox.warning(self, "Error", "Valores de gas inválidos")
+                    return
+            else:
+                # Calcular automáticamente
+                gas_params = self.current_wallet.calculate_optimal_gas(token_symbol)
+                gas_price = gas_params['gas_price']
+                gas_limit = gas_params['gas_limit']
+                
+            # Mostrar confirmación
+            confirm_msg = (
+                f"¿Confirmar envío de {amount} {token_symbol} a {recipient}?\n\n"
+                f"Tarifa estimada: {(gas_price * gas_limit)/1e9:.6f} BNB (~${(gas_price * gas_limit)/1e9 * self.bnb_price:.2f} USD)"
+            )
+            
+            reply = QMessageBox.question(
+                self, 'Confirmar Transacción', 
+                confirm_msg,
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.show_loading("Enviando transacción...")
+                
+                # Usar el método send_transaction de CryptoWallet
+                worker = Worker(
+                    self.current_wallet.send_transaction,
+                    recipient,
+                    amount,
+                    token_symbol,
+                    gas_price,
+                    gas_limit
+                )
+                worker.finished.connect(self.on_transaction_sent)
+                worker.error.connect(self.on_transaction_error)
+                self.active_workers.append(worker)
+                worker.start()
+                
+        except Exception as e:
+            self.show_loading(False)
+            QMessageBox.critical(self, "Error", f"Error al preparar transacción: {str(e)}")
+
     def setup_menu_bar(self):
         """Configura la barra de menú"""
         menubar = self.menuBar()
@@ -2124,7 +2199,7 @@ class SolidWalletGUI(QMainWindow):
                 background-color: #3a7bc8;
             }
         """)
-        self.send_button.clicked.connect(self.send_transaction)
+        self.send_button.clicked.connect(self.on_send_button_clicked)
         layout.addWidget(self.send_button)
         
         self.send_tab.setLayout(layout)
