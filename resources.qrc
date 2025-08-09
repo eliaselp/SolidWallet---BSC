@@ -9,5 +9,6 @@
     <file>icons/online.svg</file>
     <file>icons/offline.svg</file>
     <file>icons/warning.svg</file>
+    <file>icons/settings.svg</file>
   </qresource>
 </RCC>
